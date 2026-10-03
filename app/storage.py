@@ -1,11 +1,15 @@
 """SQLite 持久化层。
 
-四张表：
+五张表：
 - projects：选址项目
 - versions：项目下的数据版本（居民点 + 候选址 + 父版本指针），旧版本原样保留
 - solutions：版本在固定 (radius, 必开集合) 下的求解结果；同参数重复求解
   直接取回已有记录（upsert，不产生重复）
 - jobs：后台作业（求解 / 半径扫描），服务重启时把未完成作业标 interrupted
+- plans：分期建设计划（分期求解结果、确认状态、乐观锁版本号）
+
+建表与版本化升级在 migrations 模块；旧库（没有 plans 表、居民点没有
+weight 字段）直接挂载即可继续使用，不要求清库。
 
 所有连接 check_same_thread=False；WAL 打开。写操作都在短事务中。
 """
@@ -18,6 +22,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+from .migrations import hydrate_version_row, migrate
+
+# 计划状态
+PLAN_ACTIVE = "active"            # 还能确认后续期 / 调预算重排
+PLAN_COMPLETED = "completed"      # 最后一期已确认
+PLAN_INFEASIBLE = "infeasible"    # 无论如何排都收不了口
 
 # 作业状态
 JOB_QUEUED = "queued"
@@ -34,51 +45,9 @@ JOB_KIND_SWEEP = "sweep"
 _TERMINAL = {JOB_COMPLETED, JOB_TIMEOUT, JOB_CANCELLED,
              JOB_INTERRUPTED, JOB_FAILED}
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS versions (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    version_no INTEGER NOT NULL,
-    parent_version_id TEXT,
-    change_note TEXT,
-    residents TEXT NOT NULL,   -- [{"id":..,"x":..,"y":..}]
-    stations TEXT NOT NULL,    -- [{"id":..,"x":..,"y":..}]
-    created_at REAL NOT NULL,
-    UNIQUE(project_id, version_no)
-);
-CREATE TABLE IF NOT EXISTS solutions (
-    id TEXT PRIMARY KEY,
-    version_id TEXT NOT NULL REFERENCES versions(id),
-    radius REAL NOT NULL,
-    forced TEXT NOT NULL,      -- JSON 排序后的下标数组
-    result_json TEXT NOT NULL,
-    strategy TEXT NOT NULL DEFAULT 'full',
-    updated_at REAL NOT NULL,
-    UNIQUE(version_id, radius, forced)
-);
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    version_id TEXT NOT NULL,
-    params_json TEXT NOT NULL,
-    status TEXT NOT NULL,
-    progress_json TEXT,
-    result_json TEXT,
-    error TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    started_at REAL,
-    finished_at REAL
-);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_versions_project ON versions(project_id);
-"""
+
+class DuplicatePlanError(Exception):
+    """(版本,半径,必开,期数,各期预算) 的计划已存在。"""
 
 
 class Storage:
@@ -91,8 +60,7 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        migrate(self._conn)
 
     def close(self):
         with self._lock:
@@ -152,10 +120,7 @@ class Storage:
             ).fetchone()
         if not row:
             return None
-        d = dict(row)
-        d["residents"] = json.loads(d["residents"])
-        d["stations"] = json.loads(d["stations"])
-        return d
+        return hydrate_version_row(dict(row))
 
     def get_version_by_no(self, project_id: str, version_no: int):
         with self._lock:
@@ -165,10 +130,7 @@ class Storage:
             ).fetchone()
         if not row:
             return None
-        d = dict(row)
-        d["residents"] = json.loads(d["residents"])
-        d["stations"] = json.loads(d["stations"])
-        return d
+        return hydrate_version_row(dict(row))
 
     def list_versions(self, project_id: str) -> list[dict]:
         with self._lock:
@@ -318,3 +280,118 @@ class Storage:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ---------------------------------------------------------------
+    # 分期建设计划
+    # ---------------------------------------------------------------
+    @staticmethod
+    def plan_key(radius: float, forced_ids: list[str], budgets: list[int]) -> tuple:
+        return (radius, json.dumps(sorted(forced_ids), ensure_ascii=False),
+                len(budgets), json.dumps(budgets))
+
+    def find_plan(self, version_id: str, radius: float, forced_ids: list[str],
+                  budgets: list[int]):
+        _, forced_key, periods, budgets_key = self.plan_key(
+            radius, forced_ids, budgets)
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM plans WHERE version_id=? AND radius=?
+                   AND forced=? AND periods=? AND budgets=?""",
+                (version_id, radius, forced_key, periods, budgets_key),
+            ).fetchone()
+        return self._hydrate_plan(dict(row)) if row else None
+
+    def get_plan(self, plan_id: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        return self._hydrate_plan(dict(row)) if row else None
+
+    def list_plans(self, version_id: str | None = None) -> list[dict]:
+        with self._lock:
+            if version_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM plans WHERE version_id=? ORDER BY created_at",
+                    (version_id,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM plans ORDER BY created_at").fetchall()
+        return [self._hydrate_plan(dict(r)) for r in rows]
+
+    @staticmethod
+    def _hydrate_plan(d: dict) -> dict:
+        d["forced_ids"] = json.loads(d.pop("forced"))
+        d["budgets"] = json.loads(d.pop("budgets"))
+        d["locked"] = json.loads(d.pop("locked_json"))
+        d["result"] = json.loads(d.pop("result_json"))
+        return d
+
+    def insert_plan(self, *, version_id: str, radius: float,
+                    forced_ids: list[str], budgets: list[int], status: str,
+                    confirmed_periods: int, locked: list[list[str]],
+                    objective: str, unphased_count: int | None,
+                    result: dict) -> dict:
+        _, forced_key, periods, budgets_key = self.plan_key(
+            radius, forced_ids, budgets)
+        pid = self.new_id()
+        now = time.time()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """INSERT INTO plans(id,version_id,radius,forced,periods,
+                       budgets,status,confirmed_periods,locked_json,revision,
+                       objective,unphased_count,result_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pid, version_id, radius, forced_key, periods, budgets_key,
+                     status, confirmed_periods,
+                     json.dumps(locked, ensure_ascii=False), 0, objective,
+                     unphased_count, json.dumps(result, ensure_ascii=False),
+                     now, now),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                raise DuplicatePlanError(str(exc)) from exc
+        return self.get_plan(pid)
+
+    def cas_update_plan(self, plan_id: str, expected_revision: int,
+                        *, budgets: list[int] | None = None,
+                        status: str | None = None,
+                        confirmed_periods: int | None = None,
+                        locked: list[list[str]] | None = None,
+                        unphased_count: int | None = None,
+                        result: dict | None = None) -> dict | None:
+        """乐观锁条件更新：revision 必须等于客户端看到的值。
+
+        命中返回更新后的计划；revision 已被别人推进则返回 None（调用方
+        转成 409 冲突，绝不静默覆盖）。
+        """
+        now = time.time()
+        sets = ["revision=revision+1", "updated_at=?"]
+        args: list = [now]
+        if budgets is not None:
+            sets.append("budgets=?")
+            args.append(json.dumps(budgets))
+        if status is not None:
+            sets.append("status=?")
+            args.append(status)
+        if confirmed_periods is not None:
+            sets.append("confirmed_periods=?")
+            args.append(confirmed_periods)
+        if locked is not None:
+            sets.append("locked_json=?")
+            args.append(json.dumps(locked, ensure_ascii=False))
+        if unphased_count is not None:
+            sets.append("unphased_count=?")
+            args.append(unphased_count)
+        if result is not None:
+            sets.append("result_json=?")
+            args.append(json.dumps(result, ensure_ascii=False))
+        args += [plan_id, expected_revision]
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE plans SET {', '.join(sets)} WHERE id=? AND revision=?",
+                args)
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get_plan(plan_id)

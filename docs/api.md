@@ -145,11 +145,107 @@
 超时后剩余半径标 `not_computed`，取消后标 `cancelled`，已算完的步骤
 全部保留；作业状态为 `timeout`/`cancelled` 而非 `completed`。
 
-## 5. 健康检查
+## 5. 分期建设计划
+
+居民点可带 `weight`（正数，不填按 1）：表示该点代表多少人，只影响
+分期人口统计，不影响最少开站求解结果。
+
+### POST /api/projects/{project_id}/versions/{version_id}/plans
+发起（或幂等取回）一份分期建设计划：
+```json
+{
+  "radius": 3.0,
+  "budgets": [1, 1, 1],
+  "forced_station_ids": [],
+  "time_limit": 30
+}
+```
+- `budgets`：每期最多**新建**几座站，列表长度即期数（2~3 期或更多）；
+  元素非负、列表非空，否则 422 `field=budgets`；
+- 半径非正 → 400；点名的站不存在 → 404 `field=forced_station_ids`。
+
+→ 201（新建）或 200（同参数已有记录，`reused=true`，不产生重复）：
+```json
+{
+  "reused": false, "created": true,
+  "plan": {
+    "id": "...", "revision": 0, "status": "active",
+    "radius": 3.0, "forced_station_ids": [],
+    "periods": 3, "budgets": [1,1,1],
+    "confirmed_periods": 0, "locked_periods": [],
+    "unphased_min_station_count": 3,
+    "objective": "lex_min_stations_then_lex_max_covered_population",
+    "plan": {
+      "status": "optimal", "feasible": true, "proven_optimal": true,
+      "total_station_count": 3, "extra_over_unphased": 0,
+      "total_population": 56.0,
+      "phases": [
+        {"period": 0, "new_station_ids": ["C2"],
+         "cumulative_station_ids": ["C2"],
+         "cumulative_population": 28.0},
+        {"period": 1, "new_station_ids": ["C1"],
+         "cumulative_station_ids": ["C1","C2"],
+         "cumulative_population": 50.0},
+        {"period": 2, "new_station_ids": ["C3"],
+         "cumulative_station_ids": ["C1","C2","C3"],
+         "cumulative_population": 56.0}
+      ],
+      "unphased_min_station_count": 3,
+      "infeasible_reason": null, "uncovered_resident_ids": [],
+      "blocked_at_period": null, "budget_shortage": null, "note": null
+    }
+  }
+}
+```
+
+优化目标（详见 `docs/algorithm.md` 第 7 节）：**先把总站数锁到最少**
+（正常 `extra_over_unphased=0`），同站数下再逐期最大化累计照顾人口，
+再平局取编号最小的站集合。规模/时限导致没证完时
+`plan.status="best_feasible"`、`proven_optimal=false`，计划仍合法。
+
+收不了口时计划记录照常创建，但外层 `status="infeasible"`，内层：
+- 全开够不着：`uncovered_resident_ids` 列出够不着的居民点；
+- 预算注定不够：`blocked_at_period`（0 起，第一个累计预算不够的期）、
+  `budget_shortage`（该期累计缺口座数）、`infeasible_reason`。
+这种计划不能确认（409）。时限内无法给结论时不产生记录，返回
+`{"inconclusive": true, "result": {...}}`。
+
+### GET /api/projects/{project_id}/versions/{version_id}/plans
+列出版本下全部计划。
+
+### GET /api/projects/{project_id}/versions/{version_id}/plans/{plan_id}
+取回单份计划（含 `revision`、确认状态、各期排布）。
+
+### POST /api/projects/{project_id}/versions/{version_id}/plans/{plan_id}/confirm
+确认某一期开工：
+```json
+{ "revision": 0, "period": 0 }
+```
+- `revision`：取回计划时看到的版本号（乐观锁）；
+- 第 k 期必须在第 k-1 期确认后才能确认；重复/跳期确认 → 409
+  `field=period`；
+- 与另一位同事的确认/重排竞争落败 → 409 `field=revision`，错误信息
+  明确说明"你看到的计划已经过时"，`details.current_revision` 给出
+  最新版本号，**本次提交不落库**；
+- 确认最后一期后计划状态变 `completed`。
+
+### POST /api/projects/{project_id}/versions/{version_id}/plans/{plan_id}/replan
+调整各期预算后重排（期数不能变）：
+```json
+{ "revision": 1, "budgets": [1, 2, 2] }
+```
+- 已确认各期**原样锁死**；其新预算若小于已开工站数 → 409
+  `field=budgets.t`，`details` 给出该期已建数；
+- 改期数 → 400 `field=budgets`；
+- 旧 revision 提交 → 409 `field=revision`（同上，绝不静默覆盖）；
+- 重排后若新预算注定收不了口，计划状态变 `infeasible`，诊断字段
+  照填，但已确认期保留。
+
+## 6. 健康检查
 
 ### GET /health → `{"status":"ok"}`
 
-## 6. 状态语义一览（重点防错）
+## 7. 状态语义一览（重点防错）
 
 | 情形 | 作业 status | result.status | proven_optimal |
 |---|---|---|---|
