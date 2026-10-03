@@ -1,13 +1,18 @@
 """SQLite 持久化层。
 
-四张表：
+五张表：
 - projects：选址项目
 - versions：项目下的数据版本（居民点 + 候选址 + 父版本指针），旧版本原样保留
+  居民点可选带 weight（人口权重）；旧服务写入的数据没有该字段，取回时
+  一律按 1 补齐（存储升级在读取时懒完成，不要求清库/重导）
 - solutions：版本在固定 (radius, 必开集合) 下的求解结果；同参数重复求解
   直接取回已有记录（upsert，不产生重复）
+- plans：挂在版本上的分期建设计划，按 (radius, 预算序列, 必开集合) 去重；
+  revision 为乐观锁版本号，每次确认/重排自增
 - jobs：后台作业（求解 / 半径扫描），服务重启时把未完成作业标 interrupted
 
 所有连接 check_same_thread=False；WAL 打开。写操作都在短事务中。
+旧库（无 plans 表 / 无 PRAGMA user_version）启动时由 _ensure_schema 平滑升级。
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ JOB_KIND_SWEEP = "sweep"
 _TERMINAL = {JOB_COMPLETED, JOB_TIMEOUT, JOB_CANCELLED,
              JOB_INTERRUPTED, JOB_FAILED}
 
+# 数据库 schema 版本（旧库无 user_version，即 0）
+SCHEMA_VERSION = 1
+
+# plans 表：revision 乐观锁；参数键做幂等去重
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -46,7 +55,7 @@ CREATE TABLE IF NOT EXISTS versions (
     version_no INTEGER NOT NULL,
     parent_version_id TEXT,
     change_note TEXT,
-    residents TEXT NOT NULL,   -- [{"id":..,"x":..,"y":..}]
+    residents TEXT NOT NULL,   -- [{"id":..,"x":..,"y":..,"weight"?:..}]
     stations TEXT NOT NULL,    -- [{"id":..,"x":..,"y":..}]
     created_at REAL NOT NULL,
     UNIQUE(project_id, version_no)
@@ -60,6 +69,20 @@ CREATE TABLE IF NOT EXISTS solutions (
     strategy TEXT NOT NULL DEFAULT 'full',
     updated_at REAL NOT NULL,
     UNIQUE(version_id, radius, forced)
+);
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL REFERENCES versions(id),
+    radius REAL NOT NULL,
+    budgets TEXT NOT NULL,     -- JSON 每期新建上限数组
+    forced TEXT NOT NULL,      -- JSON 排序后的下标数组
+    result_json TEXT NOT NULL,
+    confirmed_until INTEGER NOT NULL,  -- 已确认到第几期（-1=未确认，0=第1期已确认）
+    state TEXT NOT NULL,      -- planning | completed
+    revision INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(version_id, radius, budgets, forced)
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -78,6 +101,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_versions_project ON versions(project_id);
+CREATE INDEX IF NOT EXISTS idx_plans_version ON plans(version_id);
 """
 
 
@@ -91,8 +115,17 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA)
+        self._ensure_schema()
         self._conn.commit()
+
+    def _ensure_schema(self):
+        """旧库平滑升级：CREATE TABLE IF NOT EXISTS 补齐新表后标记版本。
+
+        居民点 weight 字段不做一次性数据搬迁——旧记录在读取时按 1 补齐，
+        避免对挂载的长期数据目录做不可逆的批量改写。
+        """
+        self._conn.executescript(_SCHEMA)
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self):
         with self._lock:
@@ -153,7 +186,7 @@ class Storage:
         if not row:
             return None
         d = dict(row)
-        d["residents"] = json.loads(d["residents"])
+        d["residents"] = self._hydrate_residents(json.loads(d["residents"]))
         d["stations"] = json.loads(d["stations"])
         return d
 
@@ -166,9 +199,17 @@ class Storage:
         if not row:
             return None
         d = dict(row)
-        d["residents"] = json.loads(d["residents"])
+        d["residents"] = self._hydrate_residents(json.loads(d["residents"]))
         d["stations"] = json.loads(d["stations"])
         return d
+
+    @staticmethod
+    def _hydrate_residents(rows: list[dict]) -> list[dict]:
+        # 旧服务写入的居民点没有 weight：一律按 1 补齐
+        for r in rows:
+            if "weight" not in r or r["weight"] is None:
+                r["weight"] = 1.0
+        return rows
 
     def list_versions(self, project_id: str) -> list[dict]:
         with self._lock:
@@ -318,3 +359,106 @@ class Storage:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ---------------------------------------------------------------
+    # 分期计划
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _plan_key(radius: float, budgets, forced) -> tuple:
+        return (radius, json.dumps(list(budgets)),
+                json.dumps(sorted(forced)))
+
+    def create_plan(self, version_id: str, radius: float, budgets,
+                    forced, result: dict, confirmed_until: int,
+                    state: str = "planning") -> dict | None:
+        """按 (version, radius, budgets, forced) 幂等创建。
+
+        已存在同参数计划 → 返回 None（调用方改为取回旧记录，不重复
+        产生记录）。
+        """
+        pid = self.new_id()
+        now = time.time()
+        _, bkey, fkey = self._plan_key(radius, budgets, forced)
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT id FROM plans WHERE version_id=? AND radius=? "
+                "AND budgets=? AND forced=?",
+                (version_id, radius, bkey, fkey),
+            ).fetchone()
+            if exists:
+                return None
+            self._conn.execute(
+                """INSERT INTO plans(id,version_id,radius,budgets,forced,
+                   result_json,confirmed_until,state,revision,
+                   created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, version_id, radius, bkey, fkey,
+                 json.dumps(result, ensure_ascii=False),
+                 confirmed_until, state, 1, now, now),
+            )
+            self._conn.commit()
+        return self.get_plan(pid)
+
+    def get_plan(self, plan_id: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        return self._hydrate_plan(dict(row)) if row else None
+
+    def find_plan(self, version_id: str, radius: float, budgets, forced):
+        _, bkey, fkey = self._plan_key(radius, budgets, forced)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM plans WHERE version_id=? AND radius=? "
+                "AND budgets=? AND forced=?",
+                (version_id, radius, bkey, fkey),
+            ).fetchone()
+        return self._hydrate_plan(dict(row)) if row else None
+
+    def list_plans(self, version_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM plans WHERE version_id=? ORDER BY created_at",
+                (version_id,),
+            ).fetchall()
+        return [self._hydrate_plan(dict(r)) for r in rows]
+
+    @staticmethod
+    def _hydrate_plan(d: dict) -> dict:
+        d["budgets"] = json.loads(d["budgets"])
+        d["forced"] = json.loads(d["forced"])
+        d["result_json"] = json.loads(d["result_json"])
+        return d
+
+    def cas_plan(self, plan_id: str, expected_revision: int,
+                 *, result: dict | None = None, budgets=None,
+                 confirmed_until: int | None = None,
+                 state: str | None = None) -> dict | None:
+        """乐观锁条件更新：仅当 revision == expected_revision 时写入并
+        把 revision +1。冲突（计划不存在 / revision 过时）返回 None，
+        调用方据此报 409，绝不静默覆盖。
+        """
+        now = time.time()
+        sets = ["revision=revision+1", "updated_at=?"]
+        args: list = [now]
+        if result is not None:
+            sets.append("result_json=?")
+            args.append(json.dumps(result, ensure_ascii=False))
+        if budgets is not None:
+            sets.append("budgets=?")
+            args.append(json.dumps(list(budgets)))
+        if confirmed_until is not None:
+            sets.append("confirmed_until=?")
+            args.append(confirmed_until)
+        if state is not None:
+            sets.append("state=?")
+            args.append(state)
+        args += [plan_id, expected_revision]
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE plans SET {', '.join(sets)} WHERE id=? "
+                f"AND revision=?", args)
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get_plan(plan_id)

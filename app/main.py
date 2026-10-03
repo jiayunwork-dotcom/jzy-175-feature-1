@@ -11,10 +11,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from .api.plans_routes import router as plans_router
 from .api.routes import router
 from .config import settings
 from .errors import register_exception_handlers
 from .jobs import JobManager
+from .plans import PlanManager
 from .storage import Storage
 
 
@@ -27,9 +29,11 @@ def create_app(db_path: str | None = None,
     async def lifespan(app: FastAPI):
         storage = Storage(db_path)
         jobs = JobManager(storage, max_workers=max_workers)
+        plans = PlanManager(storage)
         recovered = jobs.start()
         app.state.storage = storage
         app.state.jobs = jobs
+        app.state.plans = plans
         app.state.recovered_on_boot = recovered
         yield
         jobs.shutdown(wait=False)
@@ -37,13 +41,15 @@ def create_app(db_path: str | None = None,
 
     app = FastAPI(
         title="社区服务站精确选址后端",
-        version="1.0.0",
+        version="1.1.0",
         description="平面欧氏距离、统一半径、最少开站数的精确分支定界求解，"
-                    "支持版本化存储、后台作业与增量重解。",
+                    "支持版本化存储、后台作业、增量重解与人口权重下的"
+                    "分期建设计划。",
         lifespan=lifespan,
     )
     register_exception_handlers(app)
     app.include_router(router)
+    app.include_router(plans_router)
 
     @app.get("/health")
     def health():
